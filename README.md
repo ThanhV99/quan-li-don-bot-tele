@@ -24,9 +24,12 @@ Chạy trực tiếp (phát triển): `pipenv install && API_URL=http://127.0.0.
 
 ## Cách gọi web
 
-`remote.py` thay cho các module của web (`db`, `tracking`, `sale_text`, `utils`, `alert_rules`): mỗi lệnh gọi hàm là
-một yêu cầu `POST {API_URL}/api/svc/<module>.<hàm>` kèm header `X-Service-Token`; dữ liệu mã hóa theo `rpc.py`
-(giống hệt bản bên web). Hàm tính toán thuần (định dạng tiền…) được nhớ kết quả nên không gọi lại.
+`remote.py` thay cho các module của web:
+- `db`: mỗi lệnh đọc / ghi dữ liệu là một yêu cầu `POST {API_URL}/api/svc/db.<hàm>` kèm header `X-Service-Token`; dữ liệu mã hóa
+  theo `rpc.py` (giống hệt bản bên web). Lệnh đọc được nhớ trong một lượt xử lý tin nhắn (ghi là xóa) cho đỡ gọi qua mạng.
+- `utils`, `alert_rules`, `net`, `sale_text`, `tracking`: lúc khởi động bot **tải mã nguồn từ web** rồi chạy tại chỗ (định dạng
+  tiền, đọc sale…), hằng số lấy theo giá trị bên web; tra vận đơn và các việc cần database vẫn chạy ở web. Code chỉ nằm ở repo
+  web; web đổi code thì bot tự khởi động lại (trong ~10 phút) để nạp bản mới.
 
 ## File
 

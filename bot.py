@@ -307,17 +307,32 @@ def suggested_price(r) -> tuple[tuple | None, str]:
 
 
 def unit_price_hint(r) -> str:
-    """Nhắc nhập giá 1 cái khi đơn có nhiều cái."""
+    """Nhắc nhập giá 1 cái khi đơn có nhiều cái (+ bán 1 phần: thêm số cái, vd 2tr65 1c)."""
     qty = order_qty(r)
-    return f"\n🔢 Đơn {qty} cái: gõ giá <b>1 cái</b>, bot tự nhân × {qty}." if qty > 1 else ""
+    return (f"\n🔢 Đơn {qty} cái: gõ giá <b>1 cái</b>, bot tự nhân × {qty}. Chỉ bán vài cái thì thêm số cái, "
+            f"vd <code>2tr65 1c</code>: phần còn lại tách thành đơn mới." if qty > 1 else "")
+
+
+# số cái bán ở cuối giá: "2tr65 1c", "2tr65 1 cái", "2tr65 x1", "2tr65 sl1" (phải có c / cái / x / sl, để khỏi lẫn với giá)
+SELL_QTY_RE = re.compile(r"\s+(?:(?:x|sl)\s*(\d+)|(\d+)\s*(?:c|cái|cai))\s*$", re.I)
+
+
+def split_sell_qty(text: str) -> tuple[str, int | None]:
+    """"2tr65 1c" → ("2tr65", 1); không ghi số cái → (text, None)."""
+    m = SELL_QTY_RE.search(" " + text.strip())
+    if not m:
+        return text, None
+    return (" " + text.strip())[:m.start()].strip(), int(m.group(1) or m.group(2))
 
 
 def phone_tag(raw) -> str:
-    """Sau SĐT của đơn: số của tôi thì ghi lắp ở máy nào (theo danh bạ /sdt)."""
-    p = db.phone_by_number(raw)
-    if not p or not p["cua_toi"]:
+    """Sau SĐT của đơn: số của tôi thì ghi lắp ở máy nào (theo danh bạ /sdt). Danh sách số của tôi lấy 1 lần mỗi
+    lượt (db.my_phones, đệm theo lượt) thay vì tra từng số qua API."""
+    mine = db.my_phones()
+    norm = db.norm_phone(raw)
+    if not norm or norm not in mine:
         return ""
-    return f" · {PHONE_MINE} <i>{html.escape(p['may']) if p['may'] else 'số của tôi'}</i>"
+    return f" · {PHONE_MINE} <i>{html.escape(mine[norm]) if mine[norm] else 'số của tôi'}</i>"
 
 
 def qty_text(r) -> str:
@@ -373,6 +388,7 @@ def parse_id(context) -> int | None:
 
 async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # chỉ admin trong .env (ALLOWED_USER_IDS) dùng được bot này; người nhận alert chỉ nhận tin qua bot alert
+    remote.begin_request()  # đệm hàm db chỉ đọc cho lượt này (web ở xa → đỡ gọi lại qua mạng)
     user = update.effective_user
     if user is not None:  # ghi vào nhật ký đổi trạng thái đơn (db.order_status_log) ai đã đổi
         db.ACTOR.set(user.full_name or user.username or str(user.id))
@@ -1159,16 +1175,16 @@ async def on_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if table == "sales" and field == "giam_pt" and update.message.text.strip() != "-" and not db.get("sales", rec_id)["gia_goc"]:
         await update.message.reply_text("⚠️ Món này chưa có giá gốc. Sửa Giá gốc trước, hoặc gõ thẳng giá mua được.")
         return
-    value, err = parse_field_value(table, field, update.message.text)
+    text, sell_qty = update.message.text, None
+    if table == "orders" and field == "gia_thu" and context.user_data.get("done_after_price") == rec_id:
+        text, sell_qty = split_sell_qty(text)  # nút HOÀN THÀNH: "2tr65 1c" = bán 1 cái
+    value, err = parse_field_value(table, field, text)
     if err:
         await update.message.reply_text(f"⚠️ {err} Gõ lại, hoặc /huy để thôi.")
         return
     context.user_data.pop("pending_edit", None)
     if context.user_data.pop("done_after_price", None) == rec_id and field == "gia_thu" and value:
-        value = price_total(db.get("orders", rec_id), value)[0]  # giá 1 cái → tổng cả đơn
-        db.update("orders", rec_id, "gia_thu", value)  # từ nút HOÀN THÀNH: ghi giá + Hoàn thành
-        mark_done(rec_id)
-        await update.message.reply_html(sold_text(db.get("orders", rec_id)))
+        await sell_order(update.message, db.get("orders", rec_id), value, sell_qty)  # từ nút HOÀN THÀNH
         return
     await apply_edit(update.message, table, rec_id, field, value)
 
@@ -1244,7 +1260,8 @@ HELP = """🤖 <b>Bot quản lý đơn hàng</b>
 /xem · /sua · /xoa &lt;id&gt; – xem / sửa (bấm chọn trường) / xóa đơn
 /danhan &lt;id&gt; – đã nhận hàng, chưa trả công · /dsdanhan – các đơn 📦 Đã nhận
 /dsdiachi [từ khóa] – đơn Đã đặt gom theo địa chỉ giống nhau
-/ban &lt;id&gt; &lt;giá 1 cái&gt; – bán xong → Hoàn thành
+/ban &lt;id&gt; &lt;giá 1 cái&gt; [số cái] – bán xong → Hoàn thành (vd /ban 129 2tr65 1c: bán 1 cái, phần còn lại tách đơn mới)
+/tach &lt;id&gt; [số cái] – tách đơn nhiều cái (không bán): /tach 129 = thành từng đơn 1 cái
 /tim &lt;từ khóa&gt; · /khach &lt;tên|SĐT&gt; – tìm đơn
 /thongke – thống kê tháng · /traship – đơn Đã đặt theo người đặt trong khoảng ngày (bot hỏi ngày bắt đầu / kết thúc)
 /thuongsale – thưởng săn sale của chiến dịch đang bật (/thuongsale all, /thuongsale &lt;id&gt;; tạo chiến dịch trên web, trang Đơn hàng, mục 🎁 Thưởng săn sale)
@@ -1282,7 +1299,8 @@ HELP_FULL = """🤖 <b>Bot quản lý đơn hàng – đầy đủ</b>
 /chuaban – đơn chưa bán (Đã đặt + Đã nhận + Thanh toán) và tổng vốn
 /danhan &lt;id&gt; [id ...] – đã nhận hàng, chưa trả công người đặt
 /thanhtoan &lt;id&gt; [id ...] – đã nhận hàng + trả công người đặt
-/ban &lt;id&gt; &lt;giá shop thu&gt; – bán được → ghi giá, chuyển Hoàn thành
+/ban &lt;id&gt; &lt;giá shop thu 1 cái&gt; [số cái] – bán được → ghi giá, chuyển Hoàn thành; đơn nhiều cái mà chỉ bán vài cái thì ghi số cái (1c / x1): phần còn lại tách thành đơn mới ✂️ (giữ trạng thái, chia giá đặt / công theo số cái, không tính thêm mốc thưởng)
+/tach &lt;id&gt; [số cái] – tách đơn nhiều cái mà không bán: không ghi số cái = tách hết thành từng đơn 1 cái (vd đơn 2 main → 2 đơn 1 cái); ghi số cái = tách chừng đó cái ra 1 đơn mới. Giá đặt / công / giá shop thu chia theo số cái, giữ trạng thái, không tính thêm mốc thưởng
 /huydon &lt;id&gt; [id ...] – chuyển đơn sang ❌ Đã hủy
 /datlai &lt;id&gt; – chuyển đơn về Đã đặt
 
@@ -1581,11 +1599,15 @@ def make_status_list(statuses: list[str], title: str, cmd: str, footer: str):
 
 
 async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/ban <id> <giá shop thu>: ghi giá bán và chuyển đơn sang Hoàn thành."""
+    """/ban <id> <giá shop thu 1 cái> [số cái]: ghi giá bán và chuyển đơn sang Hoàn thành; số cái ít hơn số lượng
+    của đơn (vd /ban 129 2tr65 1c) = bán 1 phần, phần còn lại tách thành đơn mới."""
     if len(context.args) < 2 or not context.args[0].isdigit():
-        await update.message.reply_text("Cú pháp: /ban <id> <giá shop thu 1 cái>\nVí dụ: /ban 5 250 (= 250.000; đơn x2 → 500.000)")
+        await update.message.reply_text("Cú pháp: /ban <id> <giá shop thu 1 cái> [số cái]\n"
+                                        "Ví dụ: /ban 5 250 (= 250.000; đơn x2 → 500.000)\n"
+                                        "Bán 1 phần đơn nhiều cái: /ban 129 2tr65 1c (bán 1 cái, phần còn lại tách đơn mới)")
         return
-    rec_id, price = int(context.args[0]), parse_money(" ".join(context.args[1:]))
+    price_text, sell_qty = split_sell_qty(" ".join(context.args[1:]))
+    rec_id, price = int(context.args[0]), parse_money(price_text)
     if not price:
         await update.message.reply_text("⚠️ Giá không hợp lệ. Ví dụ: 250 (= 250.000), 1.2tr")
         return
@@ -1596,9 +1618,54 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if r["trang_thai"] == db.STATUS_CANCELED:
         await update.message.reply_text(f"Đơn #{rec_id} đã hủy. Gõ /datlai {rec_id} trước nếu muốn bán.")
         return
-    db.update("orders", rec_id, "gia_thu", price_total(r, price)[0])  # giá 1 cái → tổng cả đơn
-    mark_done(rec_id)
-    await update.message.reply_html(sold_text(db.get("orders", rec_id)))
+    await sell_order(update.message, r, price, sell_qty)
+
+
+async def sell_order(message, r, unit_price: int, qty: int | None = None):
+    """Bán: qty bỏ trống / = số lượng → cả đơn (giá 1 cái × số lượng, Hoàn thành); qty nhỏ hơn → bán 1 phần, phần còn
+    lại tách thành đơn mới (db.sell_part, người dùng yêu cầu 11/2026)."""
+    n = order_qty(r)
+    if qty is not None and not 1 <= qty <= n:
+        await message.reply_text(f"⚠️ Đơn #{r['id']} có {n} cái – số cái bán phải từ 1 tới {n}.")
+        return
+    if qty is not None and qty < n:
+        try:
+            new_id = db.sell_part(r["id"], qty, unit_price)
+        except ValueError as e:
+            await message.reply_text(f"⚠️ {e}")
+            return
+        rest = db.get("orders", new_id)
+        await message.reply_html(
+            sold_text(db.get("orders", r["id"]))
+            + f"\n✂️ {n - qty} cái còn lại → đơn mới <code>#{new_id}</code> · {status_text(rest['trang_thai'])}"
+              f" · đặt {money(rest['gia_dat'])} · công {money(rest['cong_dat'])} (/xem {new_id})")
+        return
+    db.update("orders", r["id"], "gia_thu", price_total(r, unit_price)[0])  # giá 1 cái → tổng cả đơn
+    mark_done(r["id"])
+    await message.reply_html(sold_text(db.get("orders", r["id"])))
+
+
+async def cmd_split(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tach <id> [số cái]: tách đơn nhiều cái (không bán) – không ghi số cái = tách hết thành từng đơn 1 cái; có số cái
+    = tách chừng đó cái ra 1 đơn mới. Giá đặt / công / giá shop thu chia theo số cái (db.split_order)."""
+    args = context.args
+    if not args or not args[0].isdigit() or (len(args) > 1 and not args[1].isdigit()):
+        await update.message.reply_text("Cú pháp: /tach <id> [số cái]\nVí dụ: /tach 129 (đơn 2 cái → 2 đơn 1 cái), "
+                                        "/tach 50 2 (tách 2 cái ra 1 đơn mới)")
+        return
+    rec_id = int(args[0])
+    try:
+        new_ids = db.split_order(rec_id, int(args[1])) if len(args) > 1 else db.split_all(rec_id)
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+    new_ids = new_ids if isinstance(new_ids, list) else [new_ids]
+    lines = [f"✂️ <b>Đã tách đơn #{rec_id}</b> ({len(new_ids) + 1} đơn, mỗi đơn giữ trạng thái cũ):"]
+    for i in [rec_id, *new_ids]:
+        o = db.get("orders", i)
+        lines.append(f"• <code>#{i}</code> {o['so_luong'] or 1} cái · đặt {money(o['gia_dat'])} · công {money(o['cong_dat'])}"
+                     f" · thu {money(o['gia_thu'])}" + (f" · tách từ #{o['tach_tu']}" if o["tach_tu"] else ""))
+    await update.message.reply_html("\n".join(lines))
 
 
 def sold_text(r) -> str:
@@ -4189,13 +4256,23 @@ POLL_STALE_SECONDS, POLL_EXIT_SECONDS = 120, 900
 UPDATES_REQUEST = tg_net.FailoverRequest(1)
 
 
+CODE_CHECK_SECONDS = 600  # mỗi 10 phút hỏi web đã đổi code module thuần chưa (remote.code_changed)
+
+
 async def heartbeat_loop(application):
     """Ghi giờ bot còn sống vào meta mỗi phút (khi đang nhận tin được) → /api/health và healthcheck Docker
     đọc. Kèm watchdog polling (xem POLL_STALE_SECONDS)."""
     last_reset = 0.0
+    next_code_check = time.monotonic() + CODE_CHECK_SECONDS
     while True:
         try:
             now = time.monotonic()
+            if now >= next_code_check:  # web đã đổi code module thuần → chạy lại để nạp code mới
+                next_code_check = now + CODE_CHECK_SECONDS
+                if remote.code_changed():
+                    log.warning("Web đã đổi code (utils / sale_text / tracking …) – thoát để Docker chạy lại với code mới")
+                    logging.shutdown()
+                    os._exit(1)
             stale = now - UPDATES_REQUEST.last_ok
             if stale > POLL_EXIT_SECONDS:
                 log.error("Không lấy được tin Telegram %d phút – thoát để Docker khởi động lại", stale // 60)
@@ -4300,6 +4377,7 @@ def main():
     app.add_handler(CommandHandler("danhan", make_set_status(db.STATUS_RECEIVED, "danhan")))
     app.add_handler(CommandHandler("thanhtoan", make_set_status(db.STATUS_PAID, "thanhtoan")))
     app.add_handler(CommandHandler("ban", cmd_sell))
+    app.add_handler(CommandHandler("tach", cmd_split))
     app.add_handler(CallbackQueryHandler(on_done_button, pattern=r"^done:(ok|price):\d+$"))
     app.add_handler(CallbackQueryHandler(on_cancel_button, pattern=r"^vccancel:(ok|keep):\d+$"))
     app.add_handler(CommandHandler("huydon", make_set_status(db.STATUS_CANCELED, "huydon")))
