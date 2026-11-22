@@ -2925,16 +2925,55 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _cache_qr(photo):
     try:
-        db.save_qr_cache(photo.file_id, bytes(await (await photo.get_file()).download_as_bytearray()))
+        db.save_image(photo.file_id, bytes(await (await photo.get_file()).download_as_bytearray()))
         await asyncio.sleep(1)  # chờ handler lưu file_id cho người đặt xong rồi mới chép ảnh theo tên
         db.sync_qr_images()
     except Exception as e:  # web tự tải lại sau
-        log.warning("Không lưu được ảnh QR ra đĩa: %s", e)
+        log.warning("Không lưu được ảnh vào database: %s", e)
 
 
 def cache_qr(photo):
-    """Ghi ảnh QR vừa nhận ra data/qr_cache (chạy nền) để web hiện ngay, khỏi tải lại từ Telegram."""
+    """Lưu ảnh vừa nhận (QR, ảnh sản phẩm) vào database của web (chạy nền): web hiện ảnh không cần Telegram,
+    file_id hỏng (đổi bot…) vẫn gửi lại được (reply_saved_photo)."""
     asyncio.create_task(_cache_qr(photo))
+
+
+def _bad_file_id(e: Exception) -> bool:
+    """Telegram không nhận file_id (bot khác / file_id hỏng): "Wrong file identifier/http url specified",
+    "Wrong remote file identifier specified: …"."""
+    return isinstance(e, BadRequest) and "file identifier" in str(e).lower()
+
+
+async def reply_saved_photo(message, file_id: str, **kwargs):
+    """Gửi ảnh đã lưu (QR, ảnh sản phẩm) bằng file_id; file_id hỏng → gửi ảnh lưu trong database rồi đổi mọi chỗ
+    dùng sang file_id mới (db.replace_file_id)."""
+    try:
+        return await message.reply_photo(file_id, **kwargs)
+    except BadRequest as e:
+        if not _bad_file_id(e) or (data := db.get_image(file_id)) is None:
+            raise
+    log.warning("file_id ảnh hỏng, gửi lại bằng ảnh trong database: %s…", file_id[:16])
+    sent = await message.reply_photo(data, **kwargs)
+    db.replace_file_id(file_id, sent.photo[-1].file_id)
+    return sent
+
+
+async def reply_saved_album(message, file_ids: list[str], captions: list, parse_mode: str | None = None):
+    """Như reply_saved_photo cho album 2–10 ảnh (captions: chú thích từng ảnh, None = không có)."""
+    def media(srcs):
+        return [InputMediaPhoto(src, caption=c, parse_mode=parse_mode) for src, c in zip(srcs, captions)]
+    try:
+        return await message.reply_media_group(media(file_ids))
+    except BadRequest as e:
+        if not _bad_file_id(e):
+            raise
+    datas = [db.get_image(f) for f in file_ids]
+    log.warning("file_id ảnh hỏng, gửi lại album bằng ảnh trong database (%d ảnh)", len(file_ids))
+    sent = await message.reply_media_group(media([f if d is None else d for f, d in zip(file_ids, datas)]))
+    for f, d, m in zip(file_ids, datas, sent):
+        if d is not None and m.photo:
+            db.replace_file_id(f, m.photo[-1].file_id)
+    return sent
 
 
 async def on_step_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2984,8 +3023,8 @@ async def cmd_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not r["qr_file_id"]:
         await ask_qr_photo(update.message, context, order_id)
         return
-    await update.message.reply_photo(r["qr_file_id"], caption=qr_caption(r), parse_mode="HTML",
-                                     reply_markup=qr_keyboard(r))
+    await reply_saved_photo(update.message, r["qr_file_id"], caption=qr_caption(r), parse_mode="HTML",
+                            reply_markup=qr_keyboard(r))
 
 
 async def on_qr_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3037,8 +3076,8 @@ async def send_pay(message, order_id: int):
     if not r:
         await message.reply_text("Không tìm thấy đơn.")
     elif r["qr_file_id"]:
-        await message.reply_photo(r["qr_file_id"], caption=qr_caption(r), parse_mode="HTML",
-                                  reply_markup=qr_keyboard(r))
+        await reply_saved_photo(message, r["qr_file_id"], caption=qr_caption(r), parse_mode="HTML",
+                                reply_markup=qr_keyboard(r))
     else:
         await message.reply_html(qr_caption(r) + "\n\n<i>Chưa có ảnh QR.</i>", reply_markup=qr_keyboard(r))
 
@@ -3108,8 +3147,8 @@ def person_keyboard(p) -> InlineKeyboardMarkup:
 
 async def send_person(message, p):
     if p["qr_file_id"]:
-        await message.reply_photo(p["qr_file_id"], caption=person_caption(p), parse_mode="HTML",
-                                  reply_markup=person_keyboard(p))
+        await reply_saved_photo(message, p["qr_file_id"], caption=person_caption(p), parse_mode="HTML",
+                                reply_markup=person_keyboard(p))
     else:
         await message.reply_html(person_caption(p), reply_markup=person_keyboard(p))
     await reply_long(message, person_orders_lines(p))
@@ -3569,10 +3608,10 @@ async def send_product_images(message, name: str, numbered: bool = False) -> int
     if not photos:
         return 0
     if len(photos) == 1:
-        await message.reply_photo(photos[0]["file_id"], caption="1" if numbered else None)
+        await reply_saved_photo(message, photos[0]["file_id"], caption="1" if numbered else None)
     else:
-        await message.reply_media_group([InputMediaPhoto(p["file_id"], caption=str(j + 1) if numbered else None)
-                                         for j, p in enumerate(photos)])
+        await reply_saved_album(message, [p["file_id"] for p in photos],
+                                [str(j + 1) if numbered else None for j in range(len(photos))])
     return len(photos)
 
 
@@ -3686,7 +3725,7 @@ async def on_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data["pending_pimg"] = {"name": name, "at": datetime.now().timestamp()}
     ok = db.add_product_image(name, msg.photo[-1].file_id) is not None
     if ok:
-        cache_qr(msg.photo[-1])  # lưu ảnh ra đĩa để web hiện ngay
+        cache_qr(msg.photo[-1])  # lưu ảnh vào database của web
     key = msg.media_group_id or str(msg.message_id)
     acks = context.user_data.setdefault("pimg_ack", {})
     st = acks.get(key)
@@ -3940,11 +3979,10 @@ async def send_sale_cards(message, rows, show_status: bool):
         caption = card if len(card) <= CAPTION_LIMIT else None
         try:
             if len(photos) == 1:
-                await message.reply_photo(photos[0]["file_id"], caption=caption, parse_mode="HTML")
+                await reply_saved_photo(message, photos[0]["file_id"], caption=caption, parse_mode="HTML")
             else:
-                await message.reply_media_group([
-                    InputMediaPhoto(p["file_id"], caption=caption if j == 0 else None, parse_mode="HTML")
-                    for j, p in enumerate(photos)])
+                await reply_saved_album(message, [p["file_id"] for p in photos],
+                                        [caption] + [None] * (len(photos) - 1), parse_mode="HTML")
         except Exception:  # ảnh lỗi (file_id hỏng…) → vẫn gửi thẻ chữ
             log.exception("Không gửi được ảnh sản phẩm %s", g[0]["ten_sp"])
             caption = None
