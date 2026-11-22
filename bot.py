@@ -163,14 +163,23 @@ def match_option(text: str, options) -> str | None:
     return next((o for o in options if o.lower() == text.lower()), None)
 
 
-def margin(thu, dat, cong) -> int:
-    """Chênh lệch = giá thu − (giá đặt + công đặt)."""
-    return (thu or 0) - ((dat or 0) + (cong or 0))
+def margin(thu, dat, cong, bonus=0) -> int:
+    """Chênh lệch = giá thu + bonus thu − (giá đặt + công đặt)."""
+    return (thu or 0) + (bonus or 0) - ((dat or 0) + (cong or 0))
 
 
-def margin_text(thu, dat, cong) -> str:
+def margin_text(thu, dat, cong, bonus=0) -> str:
     """Chênh lệch dạng chữ; đơn chưa bán (giá shop thu = 0) thì không tính."""
-    return money(margin(thu, dat, cong)) if thu else "chưa bán"
+    return money(margin(thu, dat, cong, bonus)) if thu else "chưa bán"
+
+
+def bonus_of(r) -> int:
+    """Bonus thu của đơn (row hoặc dict dữ liệu đang nhập; thiếu cột = 0)."""
+    return (r.get("bonus_thu") if isinstance(r, dict) else r["bonus_thu"] if "bonus_thu" in r.keys() else 0) or 0
+
+
+def bonus_note(r) -> str:
+    return f" + bonus {money(b)}" if (b := bonus_of(r)) else ""
 
 
 def link_html(url) -> str:
@@ -239,8 +248,8 @@ def fmt_record(table: str, r, rec_id=None, created_at=None) -> str:
             continue
         lines.append(f"• {label}: <b>{html.escape(str(val)) if val not in (None, '') else '—'}</b>")
     if table == "orders":
-        lines.append(f"• Chênh lệch (thu − đặt − công): "
-                     f"<b>{margin_text(get('gia_thu'), get('gia_dat'), get('cong_dat'))}</b>")
+        lines.append(f"• Chênh lệch (thu + bonus − đặt − công): "
+                     f"<b>{margin_text(get('gia_thu'), get('gia_dat'), get('cong_dat'), get('bonus_thu'))}</b>")
         has_qr = get("qr_file_id") if isinstance(r, dict) else ("qr_file_id" in r.keys() and r["qr_file_id"])
         qr_hint = f" – xem: /qr {rec_id}" if rec_id and has_qr else ""
         lines.append(f"• QR trả công: <b>{'📷 có' if has_qr else '—'}</b>{qr_hint}")
@@ -267,8 +276,8 @@ def fmt_order_short(r) -> str:
     c = r["created_at"]  # YYYY-MM-DD HH:MM:SS
     status = r["trang_thai"] or db.STATUS_ORDERED
     if r["gia_thu"]:
-        lai = margin(r["gia_thu"], r["gia_dat"], r["cong_dat"])
-        sold = f"💰 Shop thu <b>{money(r['gia_thu'])}</b>  →  lãi <b>{'+' if lai >= 0 else ''}{money(lai)}</b>"
+        lai = margin(r["gia_thu"], r["gia_dat"], r["cong_dat"], bonus_of(r))
+        sold = f"💰 Shop thu <b>{money(r['gia_thu'])}</b>{bonus_note(r)}  →  lãi <b>{'+' if lai >= 0 else ''}{money(lai)}</b>"
     else:
         sold = "💰 <i>Chưa bán</i>"
     return (f"┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
@@ -1519,8 +1528,8 @@ def fmt_customer_order(r, show_name: bool = False) -> str:
         f"{STATUS_ICON.get(r['trang_thai'], '')} <code>#{r['id']}</code> "
         f"{r['created_at'][8:10]}/{r['created_at'][5:7]} · {name}"
         f"<b>{e(r['ten_sp'])}</b>{qty_text(r)} ({r['nguon_don'] or '—'})",
-        f"   💰 Shop thu {money(r['gia_thu']) if r['gia_thu'] else 'chưa bán'} · Đặt {money(r['gia_dat'])}"
-        f" · Công {money(r['cong_dat'])} → <b>{margin_text(r['gia_thu'], r['gia_dat'], r['cong_dat'])}</b>",
+        f"   💰 Shop thu {money(r['gia_thu']) if r['gia_thu'] else 'chưa bán'}{bonus_note(r)} · Đặt {money(r['gia_dat'])}"
+        f" · Công {money(r['cong_dat'])} → <b>{margin_text(r['gia_thu'], r['gia_dat'], r['cong_dat'], bonus_of(r))}</b>",
         f"   🔖 Mã đơn: {tracking_html(r)} · 🚚 {e(r['don_vi_vc'])}",
         f"   📞 {e(r['sdt'])}{phone_tag(r['sdt'])} · 🏠 {e(r['dia_chi'])}",
     ]
@@ -1547,7 +1556,7 @@ async def cmd_customer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         phones = sorted({o["sdt"] for o in orders if o["sdt"]})
         sold = [o for o in orders if o["trang_thai"] == db.STATUS_DONE]
         unsold = [o for o in orders if o["trang_thai"] in db.UNSOLD_STATUSES]
-        thu = sum(o["gia_thu"] or 0 for o in sold)
+        thu = sum((o["gia_thu"] or 0) + (bonus_of(o) if o["gia_thu"] else 0) for o in sold)
         dat = sum(o["gia_dat"] or 0 for o in sold)
         cong = sum(o["cong_dat"] or 0 for o in sold)
         von = sum((o["gia_dat"] or 0) + (o["cong_dat"] or 0) for o in unsold)
@@ -1670,8 +1679,8 @@ async def cmd_split(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def sold_text(r) -> str:
     return (f"✅ Đơn <code>#{r['id']}</code> {html.escape(r['ten_sp'] or '')} → <b>Hoàn thành</b>\n"
-            f"Shop thu {money(r['gia_thu'])}{f' ({order_qty(r)} cái)' if order_qty(r) > 1 else ''} − đặt {money(r['gia_dat'])} − công {money(r['cong_dat'])} = "
-            f"<b>{money(margin(r['gia_thu'], r['gia_dat'], r['cong_dat']))}</b>")
+            f"Shop thu {money(r['gia_thu'])}{f' ({order_qty(r)} cái)' if order_qty(r) > 1 else ''}{bonus_note(r)} − đặt {money(r['gia_dat'])} − công {money(r['cong_dat'])} = "
+            f"<b>{money(margin(r['gia_thu'], r['gia_dat'], r['cong_dat'], bonus_of(r)))}</b>")
 
 
 async def ask_done(message, context, order_id: int):
