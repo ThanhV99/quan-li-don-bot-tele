@@ -3,11 +3,12 @@ install() đặt vào sys.modules các module cùng tên, nên code bot giữ ng
 
 - db: module "giả", mỗi `db.<hàm>(...)` = POST {API_URL}/api/svc/db.<hàm> (token SERVICE_TOKEN); hằng số (STATUS_*,
   TABLES …) lấy 1 lần (db.__info__). Hàm thuần của db (name_key, norm_phone) chạy tại chỗ (bản trong utils).
-- utils, alert_rules, net, sale_text, tracking (LOCAL_MODULES): tải MÃ NGUỒN từ web (<module>.__source__) lúc khởi
+- utils, alert_rules, net, sale_text, tracking, track_text (LOCAL_MODULES): tải MÃ NGUỒN từ web (<module>.__source__) lúc khởi
   động rồi chạy tại chỗ (web ở Render: money(), is_supported() … gọi qua mạng thì /ds mất vài chục giây). Code vẫn chỉ
   nằm ở web. Sau khi nạp, mọi hằng số được ghi đè bằng giá trị bên web (<module>.__info__: kể cả lấy từ .env của web:
   VC_*, ADDR_ALIASES); hàm KHÔNG thuần (tracking: tra hãng, đọc/ghi hành trình, theo giờ) thay bằng lời gọi API.
   Web đổi code (code_version khác) → code_changed() → bot thoát để Docker chạy lại với code mới (bot.heartbeat_loop).
+- shipwatch: như db (mọi hàm gọi API): kiểm tra vận chuyển + alert chạy ở web, bot chỉ gọi run_pass / delivering_messages.
 - Hàm async ở web (tracking.track_saved) thành hàm async ở bot, chạy HTTP trong thread → không chặn vòng lặp bot.
 - Hàm db CHỈ ĐỌC (__info__ "read": get, list_*, phone_by_number …) được nhớ trong 1 LƯỢT xử lý tin nhắn / nút bấm
   (begin_request() ở bot.check_access): web ở xa (Render) thì /ds đỡ hàng trăm lượt gọi qua mạng. Lệnh ghi hoặc hàm
@@ -23,6 +24,8 @@ import threading
 import time
 import types
 
+from urllib.parse import urlsplit
+
 import httpx
 
 import rpc
@@ -35,8 +38,8 @@ TIMEOUT = float(os.getenv("API_TIMEOUT", "30"))
 ASYNC_TIMEOUT = 180  # tra vận đơn: chờ lượt API hãng (throttle) + hãng trả chậm
 CONNECT_RETRIES = 3  # web đang khởi động lại (deploy) → thử lại vài lần
 STARTUP_WAIT = 120  # lần đầu lấy thông tin module: chờ web lên tối đa chừng này giây
-REMOTE_MODULES = ("db",)
-LOCAL_MODULES = ("utils", "alert_rules", "net", "sale_text", "tracking")  # thứ tự nạp = thứ tự import giữa chúng
+REMOTE_MODULES = ("db", "shipwatch")  # shipwatch: kiểm tra vận chuyển + alert chạy ở web (/kiemtravc, /danggiao)
+LOCAL_MODULES = ("utils", "alert_rules", "net", "sale_text", "tracking", "track_text")  # thứ tự nạp = thứ tự import giữa chúng
 INFO_MODULES = ("utils", "alert_rules", "sale_text", "tracking")  # có __info__ (hằng số + hàm thuần / không thuần)
 PURE_CACHE_MAX = 20000
 
@@ -45,8 +48,21 @@ SOURCE = "bot"
 ACTOR: contextvars.ContextVar[str | None] = contextvars.ContextVar("db_actor", default=None)
 _REQ_CACHE: contextvars.ContextVar[dict | None] = contextvars.ContextVar("remote_req_cache", default=None)
 
-_client = httpx.Client(base_url=API_URL, timeout=TIMEOUT, trust_env=False,
-                       headers={"X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json"})
+# web ở xa (Vercel / Render) mà máy chạy bot phải qua proxy công ty: đi thẳng trước, lỗi kết nối thì thử PROXY_URL và
+# nhớ đường chạy được (giống tg_net / net). Web cùng máy (http://quan-li-don-web:8000) thì không dùng proxy.
+PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
+ROUTE_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError)
+
+
+def _new_client(proxy: str | None) -> httpx.Client:
+    return httpx.Client(base_url=API_URL, timeout=httpx.Timeout(TIMEOUT, connect=8), trust_env=False, proxy=proxy,
+                        headers={"X-Service-Token": SERVICE_TOKEN, "Content-Type": "application/json"})
+
+
+_LOCAL_API = urlsplit(API_URL).hostname in ("quan-li-don-web", "127.0.0.1", "localhost")
+_routes = [None] + ([PROXY_URL] if PROXY_URL and not _LOCAL_API else [])
+_clients = {r: _new_client(r) for r in _routes}
+_client = _clients[None]
 _pure_cache: dict[tuple, bytes] = {}
 _cache_lock = threading.Lock()
 CODE_VERSION: str | None = None  # phiên bản code module thuần đã nạp (web tính từ mã nguồn)
@@ -56,12 +72,29 @@ class RemoteError(RuntimeError):
     """Lỗi phía web khi chạy hàm (không phải lỗi kiểu có sẵn của Python)."""
 
 
+def _send(target: str, body: bytes, timeout: float) -> httpx.Response:
+    """Gửi theo đường đang dùng; lỗi đường mạng → thử đường còn lại (thẳng ↔ proxy) và nhớ đường chạy được."""
+    global _routes
+    last = None
+    for route in list(_routes):
+        try:
+            resp = _clients[route].post(f"/api/svc/{target}", content=body, timeout=httpx.Timeout(timeout, connect=8))
+        except ROUTE_ERRORS as e:
+            last = e
+            continue
+        if route != _routes[0]:
+            _routes = [route] + [r for r in _routes if r != route]
+            log.info("Web API: chuyển sang %s", f"proxy {route}" if route else "kết nối trực tiếp")
+        return resp
+    raise last
+
+
 def _post(target: str, body: bytes, retries: int, timeout: float) -> bytes:
     for attempt in range(retries + 1):
         try:
-            resp = _client.post(f"/api/svc/{target}", content=body, timeout=timeout)
+            resp = _send(target, body, timeout)
             break
-        except (httpx.ConnectError, httpx.RemoteProtocolError) as e:
+        except (*ROUTE_ERRORS, httpx.RemoteProtocolError) as e:
             if attempt >= retries:
                 raise ConnectionError(f"Không gọi được web API ({API_URL}): {e}") from e
             time.sleep(1 + attempt)

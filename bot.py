@@ -2,10 +2,8 @@ import asyncio
 import csv
 import html
 import io
-import json
 import logging
 import os
-import random
 import re
 import time
 from datetime import datetime, timedelta
@@ -45,7 +43,9 @@ remote.install()
 import alert_rules  # noqa: E402
 import db  # noqa: E402
 import sale_text  # noqa: E402
+import shipwatch  # noqa: E402 – ở web, gọi qua API (remote)
 import tracking  # noqa: E402
+from track_text import fmt_tracking, join_blocks  # noqa: E402
 from utils import (addr_groups, money, money_short, parse_money, parse_pct, parse_range, pct_text, price_after_discount, range_label,
                    range_short, social_link)  # noqa: E402
 
@@ -54,10 +54,9 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-# Tự động kiểm tra vận chuyển các đơn "Đã đặt"; khớp cụm từ trong alert_rules.py thì bot alert nhắn hành trình
+# Bot alert: trả lời /danggiao, duyệt người nhận. Việc tự kiểm tra vận chuyển + gửi alert chạy ở web (shipwatch.py)
 ALERT_BOT_TOKEN = os.getenv("ALERT_BOT_TOKEN", "")
 ALERT_CHAT_IDS = [int(x) for x in os.getenv("ALERT_CHAT_IDS", "").replace(" ", "").split(",") if x]
-TRACK_INTERVAL_HOURS = float(os.getenv("TRACK_INTERVAL_HOURS", "12"))
 
 BOT_USERNAME = ""  # gán khi bot khởi động (post_init), dùng để tạo link t.me/<bot>?start=...
 ALLOWED_USER_IDS = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
@@ -2086,45 +2085,6 @@ async def on_stats_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- tra cứu hành trình vận chuyển ----------
 
-def fmt_tracking(res: "tracking.TrackResult", order=None) -> str:
-    lines = [f"🚚 <b>{html.escape(res.carrier)}</b> · <code>{html.escape(res.tracking_no)}</code>"]
-    if order:
-        lines.append(f"🧾 Đơn #{order['id']} · 👤 {html.escape(order['ten_nguoi_dat'] or '—')}"
-                     f" · 📦 {html.escape(order['ten_sp'] or '—')}")
-    if not res.ok:
-        lines.append(f"\n⚠️ {html.escape(res.error)}")
-        if res.web_url:
-            lines.append(f'🌐 <a href="{html.escape(res.web_url)}">Mở trang tra cứu {html.escape(res.carrier)}</a>')
-        return "\n".join(lines)
-    if not res.events:
-        lines.append("\nChưa có thông tin hành trình.")
-        return "\n".join(lines)
-    latest = res.events[0]
-    lines.append(f"\n📍 <b>{html.escape(res.milestone.upper() or latest.description.upper())}</b>")
-    lines.append(f"<i>{html.escape(latest.description)} — {latest.time:%H:%M %d/%m}</i>")
-    if res.eta:
-        lines.append(f"📅 Dự kiến giao: <b>{res.eta:%d/%m/%Y}</b>")
-    lines.append("\n<b>Hành trình:</b>")
-    for ev in res.events[:10]:
-        bad = "không thành công" in ev.description.lower() or "thất bại" in ev.description.lower()
-        desc = f"⚠️ <b>{html.escape(ev.description)}</b>" if bad else html.escape(ev.description)
-        lines.append(f"▸ {ev.time:%d/%m %H:%M} · {desc}")
-    if len(res.events) > 10:
-        lines.append(f"<i>… và {len(res.events) - 10} mốc cũ hơn</i>")
-    if res.stale:
-        t = datetime.fromisoformat(res.saved_at)
-        lines.append(f"\n⚠️ Tra lại lỗi: {html.escape(res.error)}")
-        lines.append(f"<i>💾 Đang xem bản lưu lúc {t:%H:%M %d/%m} – có thể đã cũ</i>")
-        if res.web_url:
-            lines.append(f'🌐 <a href="{html.escape(res.web_url)}">Mở trang tra cứu {html.escape(res.carrier)}</a>')
-    elif res.saved_at:
-        t = datetime.fromisoformat(res.saved_at)
-        lines.append(f"\n<i>💾 Hành trình đã kết thúc, xem bản lưu lúc {t:%H:%M %d/%m} (không tra lại hãng)</i>")
-    else:
-        lines.append(f"\n<i>Cập nhật lúc {datetime.now():%H:%M %d/%m}</i>")
-    return "\n".join(lines)
-
-
 async def build_tracking(order_id: int | None = None, code: str | None = None, phone: str | None = None):
     """Trả về (nội dung HTML, bàn phím) cho 1 đơn hoặc 1 mã vận đơn (J&T, GHN cần SĐT / 4 số cuối)."""
     order = db.get("orders", order_id) if order_id else None
@@ -2180,33 +2140,7 @@ async def on_track_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- tự động theo dõi vận chuyển + alert ----------
 
-fold, _match, is_delivered = tracking.fold, tracking.match_keywords, tracking.is_delivered
-
-
-def alert_match(res: "tracking.TrackResult") -> str | None:
-    return _match(res, alert_rules.keywords_for(res.carrier))
-
-
-def cancel_match(res: "tracking.TrackResult") -> str | None:
-    """Cụm từ cho biết đơn bị hủy / hoàn về (alert_rules.CANCEL_KEYWORDS), None nếu không."""
-    return _match(res, alert_rules.cancel_keywords_for(res.carrier))
-
-
-# orders.vc_near: mức tra hành trình (tính trong tracking.py, web dùng chung)
-VC_NORMAL, VC_NEAR, VC_HUB, VC_HUB_SORTED = tracking.VC_NORMAL, tracking.VC_NEAR, tracking.VC_HUB, tracking.VC_HUB_SORTED
-hub_sorted, delivery_level = tracking.hub_sorted, tracking.delivery_level
-
-
-def alert_title(res: "tracking.TrackResult", order_id: int) -> str:
-    """Tiêu đề alert theo trạng thái hiện tại: 🚚 đang giao / ✅ đã giao / ❌ bị hủy, hoàn hàng / ⚠️ giao lỗi."""
-    status = res.milestone or res.events[0].description
-    text = fold(f"{status} {res.events[0].description}")
-    if cancel_match(res):
-        return f"🔔 <b>Đơn #{order_id} · ❌ BỊ HỦY / HOÀN HÀNG</b> ({html.escape(status)})"
-    icon = ("✅" if is_delivered(res) else
-            "⚠️" if any(fold(k) in text for k in alert_rules.FAIL_KEYWORDS) else "🚚")
-    return f"🔔 <b>Đơn #{order_id} · {icon} {html.escape(status)}</b>"
-
+fold = tracking.fold
 
 ALERT_STATUS_LABEL = {db.ALERT_APPROVED: "✅ Đang nhận", db.ALERT_PENDING: "⏳ Chờ duyệt",
                       db.ALERT_REJECTED: "⛔ Từ chối"}
@@ -2215,14 +2149,6 @@ ALERT_STATUS_LABEL = {db.ALERT_APPROVED: "✅ Đang nhận", db.ALERT_PENDING: "
 def admin_ids() -> list[int]:
     """Admin trong .env luôn nhận alert (ALERT_CHAT_IDS, trống thì ALLOWED_USER_IDS)."""
     return list(ALERT_CHAT_IDS or sorted(ALLOWED_USER_IDS))
-
-
-def alert_recipients() -> dict[int, str]:
-    """Admin + người đã được duyệt trong bảng alert_users, {chat_id: tên}."""
-    chats = {cid: "admin" for cid in admin_ids()}
-    for u in db.list_alert_users(db.ALERT_APPROVED):
-        chats.setdefault(u["chat_id"], u["ten"] or "")
-    return chats
 
 
 def alert_user_label(u) -> str:
@@ -2385,7 +2311,7 @@ async def on_alert_bot_message(app, alert_bot, message):
 
             async def run():
                 try:
-                    await refreshed_delivering(app, alert_track_link, reply_html, progress)
+                    await refreshed_delivering(alert_link_user(), reply_html, progress)
                 except Exception:
                     log.exception("Lỗi /danggiao ở bot alert")
             asyncio.create_task(run())
@@ -2456,31 +2382,6 @@ async def alert_bot_loop(app):
         await asyncio.sleep(15)
 
 
-async def send_alert(app, text: str) -> int:
-    """Gửi bằng bot alert (ALERT_BOT_TOKEN); chưa cấu hình thì dùng bot chính. Trả về số tin gửi được."""
-    chat_ids = list(alert_recipients())
-    if not chat_ids:
-        log.warning("Không có ALERT_CHAT_IDS / ALLOWED_USER_IDS để gửi alert")
-        return 0
-    sent = 0
-
-    async def send_all(bot):
-        nonlocal sent
-        for chat_id in chat_ids:
-            try:
-                await bot.send_message(chat_id, text, parse_mode="HTML", disable_web_page_preview=True)
-                sent += 1
-            except Exception as e:  # vd: người nhận chưa bấm Start với bot alert
-                log.warning("Gửi alert tới %s lỗi: %s", chat_id, e)
-
-    if ALERT_BOT_TOKEN:
-        async with Bot(ALERT_BOT_TOKEN, **tg_net.tg_bot_kwargs()) as alert_bot:
-            await send_all(alert_bot)
-    else:
-        await send_all(app.bot)
-    return sent
-
-
 # ---------- sổ địa chỉ đặt hàng ----------
 
 def fmt_address(r) -> str:
@@ -2530,12 +2431,16 @@ async def cmd_add_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- tổng hợp đơn đang giao đến (bot alert /danggiao + tự gửi khi có đơn mới vào danh sách) ----------
 
 ALERT_BOT_USERNAME = ""  # gán khi bot alert kết nối (alert_bot_loop)
-DELIVERING_META = "delivering_ids"  # meta: id các đơn đã có trong bảng tổng hợp gửi gần nhất
+
+
+def alert_link_user() -> str:
+    """Bot mở hành trình khi bấm mã vận đơn trong tin bot alert (không có bot alert: bot chính)."""
+    return ALERT_BOT_USERNAME if ALERT_BOT_TOKEN else BOT_USERNAME
 
 
 def alert_track_link(order_id: int) -> str:
-    """Link mã vận đơn trong tin bot alert → bot alert trả hành trình đơn đó (không có bot alert: bot chính)."""
-    user = ALERT_BOT_USERNAME if ALERT_BOT_TOKEN else BOT_USERNAME
+    """Link mã vận đơn trong tin bot alert → bot alert trả hành trình đơn đó."""
+    user = alert_link_user()
     return f"https://t.me/{user}?start=tr_{order_id}" if user else ""
 
 
@@ -2543,234 +2448,35 @@ def main_track_link(order_id: int) -> str:
     return f"https://t.me/{BOT_USERNAME}?start=tr_{order_id}" if BOT_USERNAME else ""
 
 
-def delivering_orders() -> list[tuple]:
-    """Đơn ⏳ Đã đặt đang sắp giao / đang giao (mức VC_NEAR tính từ hành trình đã lưu) kèm hành trình (không gọi API hãng)."""
-    out = []
-    for r in trackable_orders():
-        lg = db.get_track_log(tracking.log_key(r["ma_don"]))
-        res = tracking.result_from_dict(json.loads(lg["data"])) if lg else None
-        # theo hành trình đã lưu (có thể vừa tra trên web, bot chưa tra lại); chưa có bản lưu thì theo cờ vc_near
-        level = delivery_level(res) if res and res.events else r["vc_near"]
-        if level != VC_NEAR or (res and (lg["final"] or is_delivered(res))):
-            continue
-        out.append((r, res))
-    # mốc hành trình mới nhất trước (đơn vừa chuyển sang đang giao lên đầu)
-    return sorted(out, key=lambda x: x[1].events[0].time if x[1] and x[1].events else datetime.min, reverse=True)
+SHIPWATCH_BUDGET = 150  # giây tối đa 1 lượt tra do lệnh bot gọi (remote.ASYNC_TIMEOUT = 180)
 
 
-out_for_delivery = tracking.out_for_delivery
-
-
-def is_fail_event(ev) -> bool:
-    text = fold(ev.description)
-    return any(fold(k) in text for k in alert_rules.FAIL_KEYWORDS)
-
-
-def delivering_state(res) -> str:
-    """'giao' = đang giao (có nhân viên đang đi giao), 'sap' = đã tới bưu cục giao cuối, chưa đi giao."""
-    return "giao" if out_for_delivery(res) else "sap"
-
-
-def fmt_delivering_order(i: int, r, res, link_fn, new: bool, state: str = "") -> str:
-    esc = html.escape
-    link = link_fn(r["id"])
-    code = f'<a href="{esc(link)}"><b>{esc(r["ma_don"])}</b></a>' if link else f"<code>{esc(r['ma_don'])}</code>"
-    carrier = r["don_vi_vc"] or (res.carrier if res else "")
-    qty = r["so_luong"] or 1
-    # người đặt nằm ở dòng tiêu đề nhóm (fmt_delivering) → ở đây chỉ còn trạng thái giao + tên trên đơn
-    tag = {"giao": " · 🏍 <b>Đang giao</b>", "sap": " · 📮 Sắp giao"}.get(state, "")
-    lines = [f"{'🆕 ' if new else ''}<b>{i}. Đơn #{r['id']}</b>{tag}"
-             + (f" · 🪪 {esc(r['ten_tren_don'])}" if r["ten_tren_don"] else ""),
-             f"🚚 {esc(carrier or '—')} · {code}",
-             f"📦 {esc(r['ten_sp'] or '—')}{f' × {qty}' if qty > 1 else ''} · 💰 {money(r['gia_dat'] or 0)}"]
-    if r["sdt"]:  # SĐT trên đơn (shipper gọi số này) + số của tôi thì lắp ở máy nào
-        lines.append(f"📞 <code>{esc(r['sdt'])}</code>{phone_tag(r['sdt'])}")
-    if r["dia_chi"]:
-        lines.append(f"🏠 {esc(r['dia_chi'])}")
-    courier = tracking.courier_of(res) if res else None
-    latest_is_courier = bool(courier and res.events and courier["event"] == res.events[0])  # == (không phải is): mốc qua API là bản sao
-    if res and res.events and not latest_is_courier:
-        ev = res.events[0]
-        lines.append(f"{'⚠️' if is_fail_event(ev) else '📍'} {ev.time:%H:%M %d/%m} · {esc(ev.description)}")
-    if courier:
-        lines.append(f"🧑‍✈️ {'' if latest_is_courier else 'Lần giao trước · '}{courier['time']:%H:%M %d/%m} · "
-                     f"<b>{esc(courier['name'])}</b>" + (f" · {courier['phone']}" if courier["phone"] else "")
-                     + f" · {esc(courier['post'])}")
-    return "\n".join(lines)
-
-
-def fmt_delivering(items: list[tuple], link_fn, new_ids=frozenset()) -> list[str]:
-    """Các khối HTML: tiêu đề, rồi gom theo người đặt (người dùng yêu cầu): mỗi người 1 dòng tiêu đề số đơn + tổng giá
-    đặt, người có đơn 🏍 Đang giao (đã có nhân viên đi giao) lên trước, rồi tới 📮 Sắp giao (đã tới bưu cục cuối);
-    mỗi đơn: trạng thái giao, tên trên đơn, mã vận đơn bấm được, ĐVVC, hàng, giá đặt, địa chỉ, mốc mới nhất,
-    nhân viên giao nếu hãng có ghi (J&T)."""
-    head = f"🛵 <b>ĐƠN ĐANG GIAO ĐẾN ({len(items)})</b> · {datetime.now():%H:%M %d/%m}"
-    if not items:
-        return [head + "\n\nKhông có đơn nào đang giao."]
-    states = {r["id"]: delivering_state(res) for r, res in items}
-    n_giao = sum(st == "giao" for st in states.values())
-    total = sum(r["gia_dat"] or 0 for r, _ in items)
-    # gom theo người đặt, giữ thứ tự mốc mới nhất trước; trong mỗi người: đang giao trước sắp giao
-    people: dict[str, list] = {}
-    for r, res in items:
-        people.setdefault(" ".join((r["ten_nguoi_dat"] or "").lower().split()), []).append((r, res))
-    groups = sorted(people.values(), key=lambda g: not any(states[r["id"]] == "giao" for r, _ in g))
-    blocks = [head + f"\n🏍 Đang giao: <b>{n_giao}</b> · 📮 Sắp giao: <b>{len(items) - n_giao}</b>"
-              + f" · 👤 {len(groups)} người · 💰 tổng <b>{money(total)}</b>"
-              + (f"\n🆕 = mới vào danh sách / vừa đi giao ({len(new_ids)} đơn)" if new_ids else "")
-              + "\n<i>🏍 Đang giao = nhân viên đã nhận hàng đi giao · 📮 Sắp giao = đã tới bưu cục giao cuối</i>"
-              + "\n<i>Bấm mã vận đơn để xem hành trình từng đơn</i>"]
-    i = 0
-    for g in groups:
-        g.sort(key=lambda x: states[x[0]["id"]] != "giao")
-        n = {st: sum(states[r["id"]] == st for r, _ in g) for st in ("giao", "sap")}
-        detail = " · ".join(f"{icon} {n[st]}" for st, icon in (("giao", "🏍"), ("sap", "📮")) if n[st])
-        blocks.append(f"━━━━━━━━━━\n👤 <b>{html.escape(g[0][0]['ten_nguoi_dat'] or '—')}</b> · {len(g)} đơn ({detail})"
-                      f" · 💰 <b>{money(sum(r['gia_dat'] or 0 for r, _ in g))}</b>")
-        for r, res in g:
-            i += 1
-            blocks.append(fmt_delivering_order(i, r, res, link_fn, r["id"] in new_ids, states[r["id"]]))
-    return blocks
-
-
-def join_blocks(blocks: list[str], limit: int = 4000) -> list[str]:
-    """Ghép các khối thành tin ≤ limit ký tự (giới hạn 4096 của Telegram), không cắt giữa 1 khối."""
-    msgs, cur = [], ""
-    for b in blocks:
-        if cur and len(cur) + len(b) + 2 > limit:
-            msgs.append(cur)
-            cur = ""
-        cur = f"{cur}\n\n{b}" if cur else b
-    return msgs + [cur] if cur else msgs
-
-
-async def notify_delivering(app):
-    """Có đơn mới vào danh sách, hoặc đơn chuyển từ sắp giao sang đang giao (so với lần trước, lưu ở meta
-    {id: 'giao'|'sap'}) → bot alert gửi lại cả bảng tổng hợp."""
-    items = delivering_orders()
-    cur = {str(r["id"]): delivering_state(res) for r, res in items}
-    try:
-        prev = json.loads(db.get_meta(DELIVERING_META) or "{}")
-        prev = prev if isinstance(prev, dict) else {str(i): "sap" for i in prev}  # bản cũ: list id
-    except ValueError:
-        prev = {}
-    # đơn mới vào danh sách, hoặc từ 📮 sắp giao chuyển sang 🏍 đang giao → gửi lại bảng
-    if new := {int(i) for i, st in cur.items() if i not in prev or (st == "giao" and prev[i] != "giao")}:
-        sent = 0
-        for msg in join_blocks(fmt_delivering(items, alert_track_link, new)):
-            sent += await send_alert(app, msg)
-        if not sent:
-            return  # gửi lỗi → lần sau thử lại
-    if cur != prev:
-        db.set_meta(DELIVERING_META, json.dumps(cur))
-
-
-async def refreshed_delivering(app, link_fn, send, progress=None) -> None:
+async def refreshed_delivering(link_user: str, send, progress=None) -> None:
     """/danggiao (bot chính + bot alert): tra lại API hãng mọi đơn Đã đặt (người dùng yêu cầu: không chỉ đọc hành
-    trình đã lưu), rồi gửi bảng tổng hợp. send(html) gửi 1 tin; progress(text) báo đang tra (tin sẽ bị xóa sau)."""
-    n = len(trackable_orders())
+    trình đã lưu; chạy ở web), rồi gửi bảng tổng hợp. link_user = bot mở hành trình khi bấm mã vận đơn.
+    send(html) gửi 1 tin; progress(text) báo đang tra (tin sẽ bị xóa sau)."""
+    n = len(shipwatch.trackable_orders())
     note = await progress(f"🔄 Đang tra lại hành trình {n} đơn Đã đặt từ hãng vận chuyển…") if progress and n else None
     try:
-        s = await check_shipments(app)
+        s = await shipwatch.run_pass(force=True, budget=SHIPWATCH_BUDGET, wait=20)
+        errors = None if s["busy"] else s["errors"] + s["left"]
     except Exception:
         log.exception("Lỗi khi tra lại đơn Đã đặt cho /danggiao")
-        s = None
+        errors = None
     if note:
         try:
             await note.delete()
         except Exception:
             pass
-    blocks = fmt_delivering(delivering_orders(), link_fn)
-    if s is None or s["errors"]:
-        blocks[0] += f"\n⚠️ Tra lại lỗi {s['errors'] if s else 'cả lượt'} đơn – đơn đó dùng hành trình đã lưu"
-    for msg in join_blocks(blocks):
+    for msg in shipwatch.delivering_messages(link_user, errors):
         await send(msg)
 
 
 async def cmd_delivering(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/danggiao: tra lại các đơn Đã đặt rồi gửi bảng tổng hợp đơn đang giao đến (link mã vận đơn mở ở bot chính)."""
     msg = update.message
-    await refreshed_delivering(context.application, main_track_link,
+    await refreshed_delivering(BOT_USERNAME,
                                lambda t: msg.reply_html(t, disable_web_page_preview=True), msg.reply_text)
-
-
-def trackable_orders() -> list:
-    """Đơn Đã đặt có mã vận đơn tra được."""
-    return [r for r in db.orders_by_status([db.STATUS_ORDERED])
-            if r["ma_don"] and tracking.is_supported(r["ma_don"], r["don_vi_vc"])]
-
-
-def check_interval(level: int) -> tuple[float, float]:
-    """(chu kỳ, độ lệch ngẫu nhiên tối đa) tính bằng giây cho đơn thường / sắp giao / đã về kho cuối."""
-    if level == VC_NEAR:
-        iv, jitter = alert_rules.NEAR_CHECK_HOURS * 3600, alert_rules.NEAR_CHECK_JITTER_MINUTES * 60
-    elif level == VC_HUB:
-        iv, jitter = alert_rules.HUB_CHECK_HOURS * 3600, alert_rules.HUB_CHECK_JITTER_MINUTES * 60
-    elif level == VC_HUB_SORTED:
-        iv, jitter = alert_rules.HUB_SORTED_CHECK_HOURS * 3600, alert_rules.HUB_SORTED_CHECK_JITTER_MINUTES * 60
-    else:
-        iv, jitter = TRACK_INTERVAL_HOURS * 3600, alert_rules.CHECK_JITTER_MINUTES * 60
-    return iv, min(jitter, iv / 2)
-
-
-def schedule_next_check(order_id: int, level: int):
-    iv, jitter = check_interval(level)
-    db.set_vc_next(order_id, datetime.now().timestamp() + iv + random.uniform(-jitter, jitter))
-
-
-async def check_order(app, r, stats: dict):
-    """Tra 1 đơn, cập nhật cờ sắp giao + hẹn giờ tra lần tới; khớp alert_rules và có mốc mới thì gửi alert."""
-    res = await tracking.track_saved(r["ma_don"], r["don_vi_vc"], r["sdt"])
-    stats["checked"] += 1
-    if not res.ok:
-        # tra hãng lỗi (vd GHN bắt captcha) → dùng hành trình đã lưu (tiện ích Chrome / web gửi về) để vẫn tính mức
-        # + gửi alert; chữ ký mốc (vc_alert_last) chặn báo trùng
-        stats["errors"] += 1
-        res = tracking.with_saved_fallback(res)
-        if not res.ok:
-            schedule_next_check(r["id"], r["vc_near"])
-            return
-    level = r["vc_near"]
-    if res.ok and res.events:
-        level = delivery_level(res)
-        if level != r["vc_near"]:
-            db.set_vc_near(r["id"], level)
-    schedule_next_check(r["id"], level)
-    if not res.events:
-        return
-    stats["near"] += level == VC_NEAR
-    stats["hub"] += level in (VC_HUB, VC_HUB_SORTED)
-    canceled = cancel_match(res)
-    if not canceled and not alert_match(res):
-        return
-    stats["matched"] += 1
-    stats["canceled"] += bool(canceled)
-    latest = res.events[0]
-    signature = f"{int(latest.time.timestamp())}|{latest.code}|{latest.description}"
-    if r["vc_alert_last"] == signature:
-        return  # đã báo mốc này rồi
-    text = (alert_title(res, r["id"]) + "\n\n" + fmt_tracking(res, r)
-            + (f"\n\nXem lại / cập nhật: https://t.me/{BOT_USERNAME}?start=tr_{r['id']}" if BOT_USERNAME else ""))
-    if await send_alert(app, text):
-        db.set_vc_alert(r["id"], signature)
-        stats["alerted"] += 1
-    if canceled:
-        await notify_admins(app, cancel_prompt_text(r, res), cancel_keyboard(r["id"]))
-
-
-def cancel_prompt_text(r, res: "tracking.TrackResult") -> str:
-    """Tin bot chính gửi khi hành trình báo đơn bị hủy / hoàn: thông tin đơn + mốc mới nhất."""
-    ev = res.events[0]
-    return (f"❌ <b>Đơn #{r['id']} bị hủy / hoàn hàng</b> theo {html.escape(res.carrier)}:\n"
-            f"<i>{ev.time:%d/%m %H:%M} · {html.escape(ev.description)}</i>\n\n"
-            + fmt_record("orders", r, r["id"], r["created_at"])
-            + "\n\nChuyển đơn sang <b>Đã hủy</b>?")
-
-
-def cancel_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ Chuyển sang Đã hủy", callback_data=f"vccancel:ok:{order_id}"),
-        InlineKeyboardButton("Để nguyên", callback_data=f"vccancel:keep:{order_id}")]])
 
 
 async def on_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2793,120 +2499,19 @@ async def on_cancel_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   + "\n\n" + note, parse_mode="HTML", disable_web_page_preview=True)
 
 
-_shipments_lock = asyncio.Lock()  # watcher, /kiemtravc, /danggiao không tra chồng lên nhau
-
-
-async def check_shipments(app, orders=None) -> dict:
-    """Tra các đơn (mặc định: mọi đơn Đã đặt tra được), cách nhau 2s cho đỡ bị chặn (GHN 429, SPX)."""
-    async with _shipments_lock:
-        return await _check_shipments(app, orders)
-
-
-async def _check_shipments(app, orders=None) -> dict:
-    stats = {"checked": 0, "near": 0, "hub": 0, "matched": 0, "canceled": 0, "alerted": 0, "errors": 0}
-    for i, r in enumerate(trackable_orders() if orders is None else orders):
-        if i:
-            await asyncio.sleep(2)
-        try:
-            await check_order(app, r, stats)
-        except Exception:
-            log.exception("Lỗi khi tra vận đơn đơn #%s", r["id"])
-            stats["errors"] += 1
-            schedule_next_check(r["id"], r["vc_near"])  # không để đơn lỗi bị tra lại liên tục
-    log.info("Kiểm tra vận chuyển: %s", stats)
-    try:
-        await notify_delivering(app)
-    except Exception:
-        log.exception("Lỗi khi gửi tổng hợp đơn đang giao")
-    return stats
-
-
-async def refresh_unfinished_logs():
-    """Đơn đã rời Đã đặt nhưng hành trình lưu chưa kết thúc: tra lại (chỉ cập nhật track_logs, không alert)."""
-    for r in db.unfinished_logs(alert_rules.UNFINISHED_LOG_HOURS):
-        try:
-            res = await tracking.track_saved(r["ma_don"], r["don_vi_vc"], r["sdt"])
-            log.info("Cập nhật hành trình đơn #%s (%s): %s", r["id"], r["trang_thai"], res.milestone or res.error)
-        except Exception:
-            log.exception("Lỗi khi cập nhật hành trình đơn #%s", r["id"])
-        await asyncio.sleep(2)
-
-
-WATCH_MAX_SLEEP = 600  # thức dậy ít nhất 10 phút/lần để thấy đơn mới / đơn đổi trạng thái
-
-
-def relevel_from_logs() -> int:
-    """Tính lại mức (vc_near) của đơn Đã đặt từ hành trình đã lưu, không gọi API hãng: chạy lúc khởi động để sửa
-    alert_rules (từ khóa sắp giao / kho cuối) là nhãn trên web đúng ngay. Lên mức tra dày hơn thì dời giờ tra kế tiếp
-    về trong 1 chu kỳ mới. Trả về số đơn đổi mức."""
-    changed = 0
-    now = datetime.now().timestamp()
-    for r in trackable_orders():
-        lg = db.get_track_log(tracking.log_key(r["ma_don"]))
-        if not lg:
-            continue
-        level = delivery_level(tracking.result_from_dict(json.loads(lg["data"])))
-        if level == r["vc_near"]:
-            continue
-        db.set_vc_near(r["id"], level)
-        iv, _ = check_interval(level)
-        if r["vc_next_check"] and r["vc_next_check"] > now + iv:
-            db.set_vc_next(r["id"], now + random.uniform(0, iv))
-        changed += 1
-    return changed
-
-
-async def shipment_watch_loop(app):
-    """Mỗi đơn Đã đặt có giờ tra riêng (orders.vc_next_check): đơn thường mỗi TRACK_INTERVAL_HOURS
-    ± alert_rules.CHECK_JITTER_MINUTES, đơn sắp giao mỗi NEAR_CHECK_HOURS ± NEAR_CHECK_JITTER_MINUTES,
-    đơn đã về kho cuối mỗi HUB_CHECK_HOURS ± HUB_CHECK_JITTER_MINUTES.
-
-    Đơn chưa có giờ hẹn (đơn mới có mã) được tra lần đầu ngẫu nhiên trong alert_rules.FIRST_CHECK_MINUTES phút. Giờ hẹn lưu trong db nên khởi động lại không chạy dồn.
-    """
-    logged_next = None
-    try:
-        if n := relevel_from_logs():
-            log.info("Tính lại mức sắp giao / kho cuối theo hành trình đã lưu: %d đơn đổi mức", n)
-    except Exception:
-        log.exception("Lỗi khi tính lại mức theo hành trình đã lưu")
-    while True:
-        now = datetime.now().timestamp()
-        due = []
-        upcoming = []
-        for r in trackable_orders():
-            nxt = r["vc_next_check"]
-            if nxt is None:  # đơn mới có mã: tra lần đầu sớm (trong FIRST_CHECK_MINUTES), không đợi cả chu kỳ
-                iv, _ = check_interval(r["vc_near"])
-                nxt = now + random.uniform(0, min(iv, alert_rules.FIRST_CHECK_MINUTES * 60))
-                db.set_vc_next(r["id"], nxt)
-            (due if nxt <= now else upcoming).append((nxt, r))
-        if due:
-            try:
-                await check_shipments(app, [r for _, r in sorted(due, key=lambda x: x[0])])
-            except Exception:
-                log.exception("Lỗi khi kiểm tra vận chuyển")
-            continue
-        await refresh_unfinished_logs()
-        nxt = min((t for t, _ in upcoming), default=None)
-        if nxt != logged_next:
-            logged_next = nxt
-            if nxt is None:
-                log.info("Kiểm tra vận chuyển: không có đơn nào cần tra")
-            else:
-                ids = [r["id"] for t, r in upcoming if t == nxt]
-                log.info("Kiểm tra vận chuyển tiếp theo lúc %s (đơn #%s)",
-                         datetime.fromtimestamp(nxt).strftime("%d/%m %H:%M"), ids[0])
-        await asyncio.sleep(max(1.0, min(WATCH_MAX_SLEEP, (nxt or now + WATCH_MAX_SLEEP) - now)))
-
-
 async def cmd_check_shipments(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/kiemtravc: chạy kiểm tra vận chuyển ngay."""
+    """/kiemtravc: chạy kiểm tra vận chuyển ngay (việc tra + alert chạy ở web: shipwatch.run_pass)."""
     await update.message.reply_text("⏳ Đang kiểm tra vận chuyển các đơn Đã đặt…")
-    s = await check_shipments(context.application)
+    s = await shipwatch.run_pass(force=True, budget=SHIPWATCH_BUDGET, wait=20)
+    if s["busy"]:
+        await update.message.reply_text("⏳ Đang có lượt kiểm tra khác chạy, thử lại sau ít phút.")
+        return
     await update.message.reply_text(
         f"✅ Đã tra {s['checked']} đơn · {s['near']} đơn sắp giao · {s['hub']} đơn đã về kho cuối · {s['matched']} đơn khớp điều kiện báo · "
         f"gửi {s['alerted']} alert mới" + (f" · ❌ {s['canceled']} đơn bị hủy/hoàn" if s["canceled"] else "")
-        + (f" · {s['errors']} lỗi" if s["errors"] else ""))
+        + (f" · {s['errors']} lỗi" if s["errors"] else "")
+        + (f" · ⏭ còn {s['left']} đơn chưa kịp tra (lượt sau tra tiếp)" if s["left"] else ""))
+
 
 
 # ---------- dọn chat ----------
@@ -4346,13 +3951,12 @@ def main():
     async def post_init(application):
         global BOT_USERNAME
         BOT_USERNAME = (await application.bot.get_me()).username or ""
-        application.bot_data["watch_task"] = asyncio.create_task(shipment_watch_loop(application))
         application.bot_data["heartbeat_task"] = asyncio.create_task(heartbeat_loop(application))
         if ALERT_BOT_TOKEN:
             application.bot_data["alert_task"] = asyncio.create_task(alert_bot_loop(application))
 
     async def post_shutdown(application):
-        for key in ("watch_task", "alert_task", "heartbeat_task"):
+        for key in ("alert_task", "heartbeat_task"):
             if task := application.bot_data.get(key):
                 task.cancel()
 
